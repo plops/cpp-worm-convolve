@@ -3,7 +3,7 @@
 // Author      : Martin Kielhorn
 // Version     :
 // Copyright   : Your copyright notice
-// Description : Hello World in C++, Ansi-style
+// Description : Estimate a good illumination pattern that doesn't disturb worms
 //============================================================================
 
 #include <cvd/image_io.h>
@@ -14,6 +14,8 @@
 #include <cvd/morphology.h>
 #include <cvd/connected_components.h>
 #include <TooN/TooN.h>
+#include <TooN/optimization/downhill_simplex.h>
+#include <cvd/random.h>
 
 using namespace CVD;
 using namespace TooN;
@@ -320,7 +322,8 @@ mindist(Vector<3> point, Vector<3> origin, Vector<3> dir)
  * phi (in degree) through the volume.
  */
 void
-draw_cylinder(vector<Image<byte> > &in, Vector<3> center, double r, double theta, double phi)
+draw_cylinder(vector<Image<byte> > &in, 
+	      Vector<3> center, double r, double theta, double phi)
 {
   int
     w=in[0].size().x,
@@ -340,15 +343,177 @@ draw_cylinder(vector<Image<byte> > &in, Vector<3> center, double r, double theta
       }
 }
 
+unsigned long
+integrate_cylinder_fast(vector<Image<byte> > &in, 
+	      Vector<3> center, double r, double theta, double phi)
+{
+  int
+    w=in[0].size().x,
+    h=in[0].size().y,
+    z=in.size(),
+    i,j,k;
+  Vector<3>
+    dir=direction(theta,phi),
+    origin=.5*makeVector(w,h,z)+center;
+  double s=1/0.198;
+  unsigned long sum=0;
+  for(k=0;k<z;k++)
+    for(j=0;j<h;j++)
+      for(i=0;i<w;i++){
+    	  Vector<3> point=makeVector(i,j,k*s);
+    	  if(fabs(mindist(point,origin,dir))<r && in[k][j][i]==255)
+    		  sum++;
+      }
+  return sum;
+}
+
+/* count the number of pixels that are 255 inside
+   of the given cylinder
+*/
+unsigned long
+integrate_cylinder(vector<Image<byte> >&in,
+		   Vector<3> center, double r, double theta, double phi)
+{
+  // allocate volume for cylinder
+  vector<Image<byte> > cyl;
+  for(uint i=0;i<in.size();i++)
+    cyl.push_back(Image<byte>(in[0].size()));
+  draw_cylinder(cyl,center,r,theta,phi);
+  int
+    w=in[0].size().x,
+    h=in[0].size().y,
+    z=in.size(),
+    i,j,k;
+  unsigned long sum=0;
+  for(k=0;k<z;k++)
+    for(j=0;j<h;j++)
+      for(i=0;i<w;i++)
+	if(cyl[k][j][i]==255 && in[k][j][i]==255)
+	  sum++;
+  return sum;
+}
+
+
+vector<Image<byte> > comps,thr,medians;  
+  
+void
+scan_angles_with_cylinder()
+{
+  Vector<3> center=makeVector(10,10,10);
+  for(int phi=0;phi<180;phi+=5)
+    for(int theta=0;theta<80;theta+=5)  
+      cout<< theta << " "
+	  << phi << " "
+	  << integrate_cylinder_fast(medians,center,10,theta,phi)
+	  << endl;
+}
+
+template<class C> double length(const C& v)
+{
+  return sqrt(v*v);
+}
+
+template<class C> double simplex_size(const C& s)
+{
+  return abs(length(s.get_simplex()[s.get_best()] - 
+		    s.get_simplex()[s.get_worst()]) /
+	     length( s.get_simplex()[s.get_best()]));
+}
+
+double out_of_focus_light(const Vector<2>& v)
+{
+  return (double) integrate_cylinder_fast(medians,makeVector(10,10,0),10,v[0],v[1]);
+}
+
+/* find minimum with downhill simplex. returns the coordinates
+ * of the minimum, if VALUE is given the integral is stored there
+ */
+Vector<2>
+optimize_angle_with_cylinder(Vector<2> starting_point, double *value=0)
+{
+  // start at theta=80, phi=100
+  // Vector<2> starting_point = makeVector(80,100);
+  DownhillSimplex<2> dh_fixed(out_of_focus_light, starting_point, 4);
+  int best;
+  while(simplex_size(dh_fixed) > .02){
+    dh_fixed.iterate(out_of_focus_light);
+    best=dh_fixed.get_best();
+    cout << dh_fixed.get_simplex()[best] << 
+      " " << dh_fixed.get_values()[best] << endl;
+  }
+  if(value)
+		  *value=dh_fixed.get_values()[best];
+  return dh_fixed.get_simplex()[best];
+}
+
+/* simulated annealing */
+
+typedef Vector<2> Configuration;
+
+double energy(Configuration c)
+{
+  double value;
+  Configuration copt=optimize_angle_with_cylinder(c,&value);
+  return value;
+}
+
+int update_iterations(int iter)
+{
+  return iter;
+}
+
+double update_temperature(double temp)
+{
+  return .9*temp;
+}
+
+Configuration perturb(Configuration c_old, double step_size=8.4)
+{
+	Configuration c=c_old+step_size*makeVector((2*rand_u()-1),2*rand_u()-1);
+	// theta
+	if(c[0]<0)
+	  c[0]=0;
+	if(c[0]>90)
+	  c[0]=90;
+	// phi
+	if(c[1]<0)
+	  c[1]=0;
+	if(c[1]>180)
+	  c[1]=180;
+	return c;
+}
+
+Configuration anneal(Configuration start_configuration,
+			double start_temperature=1000,
+			int start_iterations=10)
+{
+	int iterations=start_iterations;
+	Configuration conf=start_configuration;
+	double temp=start_temperature;
+
+	for(int j=0;j<3;j++){
+	  for(int i=0;i<iterations;i++){
+	    cout << "anneal i=" << i << endl;
+	    Configuration new_conf=perturb(conf);
+	    double e1=energy(conf),e2=energy(new_conf);
+	    if((e2 <= e1) || (rand_u()<exp((e1-e2)/temp))){
+	      conf=new_conf;
+	    }
+	  }
+	  temp=update_temperature(temp);
+	  iterations=update_iterations(iterations);
+	}
+	return conf;
+}
+
 int main()
 {
   vector<Image<byte> > in;
   load_tif(in);
 
-  vector<Image<byte> > comps,thr,medians;
   vector<ImageRef> element=getDisc(6);
 
-  for(int i=0;i<in.size();i++){
+  for(uint i=0;i<in.size();i++){
     thr.push_back(threshold(in[i],14));
     Image<byte> med(thr[0].size());
     morphology(thr[thr.size()-1], element, Morphology::Median<byte>(), med);
@@ -363,7 +528,8 @@ int main()
   //  doimg(medians,1.,0.1,0.1);
 
   cout <<"finished"<<endl;
-  draw_cylinder(medians,makeVector(10,10,0),10,76,7);
+  //optimize_angle_with_cylinder(makeVector(80,100));
+  anneal(makeVector(80,100));
   uint stack=upload_stack(medians);
   for(int c=0;c<100;c++){
     for(int j=0;j<29;j++){
